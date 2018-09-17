@@ -47,11 +47,12 @@ string_axis = ["X", "Y", "Z"]
 # and NOTE_MAX especially for guitar/bass. Probably want to keep
 # FRAME_SIZE and FRAMES_PER_FFT to be powers of two.
 
-NOTE_MIN = 57       # A3
-NOTE_MAX = 69       # A4
+NOTE_RNG = 13
+NOTE_MIN = 55
+NOTE_MAX = NOTE_MIN + NOTE_RNG - 1
 FSAMP = 22050       # Sampling frequency in Hz
-FRAME_SIZE = 2048   # How many samples per frame?
-FRAMES_PER_FFT = 16 # FFT takes average across how many frames?
+FRAME_SIZE   = 2048 # How many samples per frame?
+FRAMES_PER_FFT =  8 # FFT takes average across how many frames?
 
 ######################################################################
 # Derived quantities from constants above. Note that as
@@ -90,6 +91,12 @@ class SoundProcessor:
         self.maximum   = 0
         self.threshold = 0.20
         
+        self.is_maximum  = False
+        self.is_falling  = False
+        self.is_finished = False
+        self.is_starting = False
+        self.is_silent   = True
+        
         self.peak_increasing = True
         self.peak_previous   = 0
         
@@ -99,6 +106,8 @@ class SoundProcessor:
         # Allocate space to run an FFT. 
         self.buf = np.zeros(SAMPLES_PER_FFT, dtype=np.float32)
         self.num_frames = 0
+        
+        self.freqs = (np.arange(self.imax - self.imin) + self.imin) * FREQ_STEP
 
         # Initialize audio
         self.stream = pyaudio.PyAudio().open(format=pyaudio.paInt16,
@@ -117,24 +126,41 @@ class SoundProcessor:
         print()
         
     def detect_maximum(self, peak_max):
-        is_maximum = False
+        self.is_maximum = False
+        if self.is_silent:
+            self.is_silent = False
+            self.is_starting = True
+        else:
+            self.is_starting = False
         if peak_max > self.peak_previous:
-            self.peak_increasing = True
+            if not self.peak_increasing:
+                self.peak_increasing = True
             self.peak_max        = peak_max
+            self.is_falling      = False
         else:
             if self.peak_increasing and peak_max < 0.95 * self.peak_max:
                 self.peak_increasing = False
-                is_maximum = True 
+                self.is_maximum = True
+                self.is_falling = True
         self.peak_previous = peak_max
-        return is_maximum
+        return self.is_maximum
     
     def reset_peak_detector(self):
+        if self.is_falling:
+            self.is_finished = True
+        else:
+            self.is_finished = False
         self.peak_increasing = False
         self.peak_max        = 0
-        self.is_maximum      = False   
+        self.is_maximum      = False
+        self.is_falling      = False
+        self.is_silent       = True
         
     def set_threshold(self, y):
         self.threshold = y / self.maximum
+        
+    def clear_buffer(self):
+        self.num_frames = 0
 
     def process_audio_data(self):
         # As long as we are getting data:
@@ -153,14 +179,14 @@ class SoundProcessor:
                 #print('freq: {:7.2f} Hz     note: {:>3s} {:+.2f}'.format(
                     #freq, note_name(n0), n-n0))
                 self.vals = np.abs(fft[self.imin:self.imax])
-                self.freqs = (np.arange(len(self.vals)) + self.imin) * FREQ_STEP
-                self.peaks = peakutils.indexes(self.vals, thres=0.75, min_dist=30)
+                
+                thres = min(1, self.maximum/max(self.vals) * self.threshold)
+                self.peaks = peakutils.indexes(self.vals, thres = thres, min_dist=30)
+                self.tones = self.freqs[self.peaks]
                 if len(self.peaks):
                     peak_max = np.amax(self.vals[self.peaks])
                     self.maximum = max(self.maximum, peak_max)
-                    self.peaks = np.extract(self.vals[self.peaks] > self.maximum * self.threshold, self.peaks)
-                    self.tones = self.freqs[self.peaks]
-                    self.is_maximum = self.detect_maximum(peak_max) and len(self.peaks)
+                    self.detect_maximum(peak_max)
                 else:
                     self.reset_peak_detector()
                 break
@@ -169,14 +195,15 @@ class SoundProcessor:
 
 class StringTuner:
     _learning       = None
+
     _strings        = []
     _note_num       = np.arange(NOTE_MAX - NOTE_MIN + 1) + NOTE_MIN
     _note_frq       = number_to_freq(_note_num)
     _note_str       = [note_name(note) for note in _note_num]
     
     # How much to overshoot and correct to reach a note
-    _note_overshoot = 0.25
-    _note_wiggle    = 2
+    _note_overshoot = 0.20
+    _note_wiggle    = 3
     
     def __init__(self, parent, axis):
         self._parent   = parent
@@ -186,33 +213,46 @@ class StringTuner:
         self._fit_b    = 0
         
         self._last_obs = None
+        self._last_tune_time = 0
+        self._tune_increment = 0.1
+        self._tune_step = 1
+        self._tune_time = 0
+        
+        self._motion_t = []
+        self._motion_f = []
+        
+        self._learn_frq = []
+        self._learn_pos = []
+        
         self._note = None
-        self._note_err = np.full(NOTE_MAX - NOTE_MIN + 1, 100)
-        self._note_pos = np.full(NOTE_MAX - NOTE_MIN + 1, 0)
+        
+        self._active = False
         
         StringTuner._strings.append(self)
                 
-    def send_position(self, position):
+    def send_position(self, position, when_done):
         self._position = position
-        self._parent.send_position_and_wait(self._axis, self._position)
+        self._parent.send_position(self._axis, self._position, when_done)
         
     def learn(self):
         if not StringTuner._learning:
             StringTuner._learning   = self
-            StringTuner._learn_frq = []
-            StringTuner._learn_pos = []
+            self._learn_frq = []
+            self._learn_pos = []
+            self._active = False
         else:
             StringTuner._learning   = None
-            self.compute_slope()
+            self._note = int(round(self._last_obs))
+            self._active = True
         
     def compute_slope(self):
-        if len(StringTuner._learn_frq) > 1:
-            x = StringTuner._learn_frq
-            y = StringTuner._learn_pos
+        if len(self._learn_frq) > 4:
+            x = self._learn_frq
+            y = self._learn_pos
             m,b = np.polyfit(x, y, 1)
             self._fit_m = m
             self._fit_b = b
-            self._note_pos = b + self._note_frq * m
+            print("Compute slope!", m, b)
                 
     def reset(self):
         self._parent.send("G92 %s%f" % (self._axis, 0))
@@ -221,37 +261,35 @@ class StringTuner:
     def motor_off(self):
         self._parent.send("M18 %s" % (self._axis))
         
-    def goto_note(self, n):        
-        n0 = int(round(n))
-        print("Goto note %s" % note_name(n0))
-        new_pos = self._note_pos[n0 - NOTE_MIN]
-        self.position(new_pos)
-        self._note = n0
+    def goto_note(self, n):
+        if self._active:
+            n0 = int(round(n))
+            print("Goto note %s" % note_name(n0))
+            self.settle_note(n0)
+            self._note = n0
+            self._last_obs = None
+            self._tune_step = 0.75
+            self._tune_time = 0
 
-    def tension(self, amount):
-        self.position(self._position + amount)
+    def tension(self, amount, when_done = None):
+        self.position(self._position + amount, when_done)
     
-    def position(self, pos):
-        if self._fit_m:
-            for i in range(self._note_wiggle):
-                self.send_position(pos + self._fit_m * self._note_overshoot)
-                self.send_position(pos - self._fit_m * self._note_overshoot)
-        self.send_position(pos)
-        
-    def settle_note(self, n0):
-        new_pos = self._note_pos[n0 - NOTE_MIN]
-        for i in range(self._note_wiggle):
-            self.position(new_pos + self._fit_m * self._note_overshoot)
-            self.position(new_pos - self._fit_m * self._note_overshoot)
-            
-    def settle_note1(self, n0):
-        new_pos = self._note_pos[n0 - NOTE_MIN]
-        if self._note < n0:
-            self.position(new_pos + self._fit_m * self._note_overshoot)
-        elif self._note > n0:
-            self.position(new_pos - self._fit_m * self._note_overshoot)
+    def position(self, pos, when_done=None):
+        self.send_position(pos, when_done)
 
-    def observed_frequency(self, freq):
+    def interpolate_note_pos(self, n):
+        return self._fit_b + self._fit_m * number_to_freq(n)
+    
+    def adjust_intercept(self, freq):
+        self._fit_b = self._position - self._fit_m * freq
+    
+    def settle_note(self, n0):
+        for i in range(self._note_wiggle, 0, -1):
+            self.position(self.interpolate_note_pos(n0 + self._note_overshoot*i))
+            self.position(self.interpolate_note_pos(n0 - self._note_overshoot*i))
+        self.position(self.interpolate_note_pos(n0))
+    
+    def observed_frequency(self, freq, sp):
         # Find nearest note
         n = freq_to_number(freq)
         n0 = int(round(n))
@@ -260,53 +298,79 @@ class StringTuner:
                 freq, note_name(n0), d))
         
         self._last_obs = n
+        self.record_history(freq)
+        
+        if sp.is_starting:
+            self.clear_history()
 
         # Learn from this observation
             
-        if not StringTuner._learning:
-            self.tune_to_note(freq)
-        else:
+        if PianoRoll._playing and self._active:
+            self.tune_to_note(freq)   
+        
+        if sp.is_maximum and not app._marlin._in_motion and StringTuner._learning == self:
             self._learn_pos.append(self._position)
             self._learn_frq.append(freq)
+            self.compute_slope()
             
-    def set_note_pos_and_error(self, n0, pos, err):
-        i = n0 - NOTE_MIN
-        if i > 0 and i < len(self._note_pos):
-            self._note_pos[i] = pos
-            self._note_err[i] = err
-    
+    def clear_history(self):
+        self._motion_t = []
+        self._motion_f = []
+            
+    def record_history(self, freq):
+        self._motion_t.append(time.time())
+        self._motion_f.append(freq)        
+
     def tune_to_note(self, freq):
-        err = number_to_freq(self._note) - freq
-        self.tension(err * self._fit_m)
-        self.set_note_pos_and_error(self._note, self._position, err)
+        if self._note:
+            self.adjust_intercept(freq)
+            if not app._marlin._in_motion:
+                err = number_to_freq(self._note) - freq
+                self.tension(err * self._fit_m * self._tune_step, self.motion_done)
+            return
+        
+            if time.time() - self._last_tune_time > self._tune_time:
+                # Figure out when the next tune will take place
+                self._last_tune_time = time.time()
+                self._tune_time = (FRAME_SIZE * FRAMES_PER_FFT)/FSAMP * self._tune_step * 0.25
+                self._tune_step = max(self._tune_step*0.75, 0.1)
+            
+    def motion_done(self):
+        print("Motion complete")
+        
+    @classmethod
+    def play_chord(cls, notes):
+        print("Chord:",notes)
+        strings = StringTuner.assign_strings_to_notes(notes)
+        for stng, note in zip(strings, notes):
+            if stng:
+                stng.goto_note(note)
+            
+    @classmethod
+    def assign_observations(cls, freqs, sp):
+        freqs   = freqs.tolist()
+        notes   = [freq_to_number(freq) for freq in freqs]
+        strings = StringTuner.assign_strings_to_notes(notes)
+        for stng, freq in zip(strings, freqs):
+            if stng:
+                stng.observed_frequency(freq, sp)
     
     @classmethod
-    def assign_observations(cls, freqs):
-        strg_to_freq_assignment = {}
-        unassigned_freq        = freqs.tolist()
-        unassigned_strg        = StringTuner._strings.copy()
+    def assign_strings_to_notes(cls, notes):
+        strgs = [s if s._note else None for s in StringTuner._strings]
         
-        # Map each frequency to the nearest string that has no target
-        
-        for freq in unassigned_freq:
-            # Find nearest note
-            n = freq_to_number(freq)
+        while len(strgs) < len(notes):
+            strgs.append(None)
             
-            # Assign this tone to the nearest string
-            strg   = None
-            dist   = 9999
-            for s in unassigned_strg:
-                if s._note != None and abs(n - s._note) < dist:
-                    strg = s
-
-            if strg:
-                strg_to_freq_assignment[strg] = freq
-                unassigned_freq.remove(freq)
-                unassigned_strg.remove(strg)
+        assignment = None
+        distance   = 999999
+        for perm in itertools.permutations(strgs, len(notes)):
+            d = sum([abs(n - s._note) if s and s._note else 99999 for s,n in zip(perm, notes)])
+            if d < distance:
+                assignment = perm
+                distance   = d
                 
-        # Report the observations to the strings
-        for stng, freq in strg_to_freq_assignment.items():
-            stng.observed_frequency(freq)
+        return assignment
         
     @classmethod
     def print_string_list(cls):
@@ -317,13 +381,13 @@ class StringTuner:
         
     @classmethod
     def update(cls, sp):
-        freqs = sp.tones 
-        if sp.is_maximum and len(freqs):
-            if StringTuner._learning:
-                StringTuner._learning.observed_frequency(freqs[0])
-                StringTuner._learning.tension(-5)
-            else:
-                cls.assign_observations(freqs)
+        freqs = sp.tones
+        
+        if StringTuner._learning and sp.is_maximum:
+            StringTuner._learning.observed_frequency(freqs[0], sp)
+            StringTuner._learning.tension(-5)
+            
+        cls.assign_observations(freqs, sp)
  
 class GraphPage(tk.Frame):
     def __init__(self, parent):
@@ -380,58 +444,68 @@ class FFTGraph(Figure):
             for n in range(NOTE_MAX - NOTE_MIN + 1):
                 freq = number_to_freq(n + NOTE_MIN)
                 self._subplot.axvline(x=freq,color='g',linestyle=':')
-                
+            self._subplot.axvline(x=FSAMP/2,color='b',linestyle='-')
+            self._notes = []
+            for i,s in enumerate(StringTuner._strings):
+                p = self._subplot.axvline(x=number_to_freq(0),color='g',linestyle='-')
+                self._notes.append(p)
         else:
             self._fft_plot.set_ydata(fft.vals)
             self._fft_thrs.set_ydata([t,t])
             self._fft_dots.set_xdata(fft.freqs[fft.peaks])
             self._fft_dots.set_ydata(fft.vals[fft.peaks])
             self.adjustRange(fft.maximum)
+            for i,s in enumerate(StringTuner._strings):
+                if s._note:
+                    self._notes[i].set_xdata(number_to_freq(s._note))
             
     def onclick(self, event):
-        if event.xdata:
-            StringTuner._strings[0].goto_note(freq_to_number(event.xdata))
         if event.ydata:
             self._fft.set_threshold(event.ydata)
             
 class PitchGraph(Figure):
-
     def __init__(self):
         Figure.__init__(self, figsize=(5, 5), dpi=100)
         self._subplot = self.add_subplot(111)
         self._highlight = []
 
     def refresh(self, sp):
-        if not hasattr(self,"_plots"):
+        if not hasattr(self,"_slope"):
             self._subplot.clear()
             self._subplot.set_xlabel('Pitch')
             self._subplot.set_xticks(StringTuner._note_frq);
             self._subplot.set_xticklabels(StringTuner._note_str, rotation=90)
             self._subplot.set_ylabel('Position')
             self._subplot.set_title('Pitch vs. Position')
-            self._plots = []
             self._lines = []
+            self._notes = []
             self._slope = []
             for i,s in enumerate(StringTuner._strings):
-                x = s._note_frq
-                y = s._note_pos
-                p, = self._subplot.plot(x, y,'.')
-                self._plots.append(p)
+                if len(s._learn_frq):
+                    p, = self._subplot.plot(s._learn_frq, s._learn_pos,'+')
+                                
                 p = self._subplot.axhline(y=s._position,color='g',linestyle=':')
                 self._lines.append(p)
-                p, = self._subplot.plot([x[0], x[-1]], [0,0],':')
+                
+                p = self._subplot.axvline(x=s._note_frq[0],color='g',linestyle=':')
+                self._notes.append(p)
+                
+                p, = self._subplot.plot([s._note_frq[0], s._note_frq[-1]], [0,0],':',color='r')
                 self._slope.append(p)
             #self._subplot.autoscale(False)
         else:
             if len(sp.peaks) == 0:
                 self.remove_highlights()
             for i,s in enumerate(StringTuner._strings):
-                self._plots[i].set_ydata(s._note_pos)
                 self._lines[i].set_ydata(s._position)
+                if s._note:
+                    self._notes[i].set_xdata(number_to_freq(s._note))
                 if hasattr(s, '_fit_m'):
                     m = s._fit_m
                     b = s._fit_b
-                    self._slope[i].set_ydata([s._note_frq[0]*m+b,s._note_frq[-1]*m+b])
+                    y0 = s._note_frq[ 0]*m+b
+                    y1 = s._note_frq[-1]*m+b
+                    self._slope[i].set_ydata([y0, y1])
             # Highlight the pitches in the data
             if sp.is_maximum:
                 for i,s in enumerate(StringTuner._strings):
@@ -458,6 +532,25 @@ class PitchGraph(Figure):
     def onclick(self, event):
         if event.xdata:
             StringTuner._strings[0].goto_note(freq_to_number(event.xdata))
+            
+class MotionGraph(Figure):
+    def __init__(self):
+        Figure.__init__(self, figsize=(5, 5), dpi=100)
+        self._subplot = self.add_subplot(111)
+        
+    def refresh(self, sp):
+        if sp.is_finished:
+            self._subplot.clear()
+            self._subplot.set_xlabel('Time')
+            for i,s in enumerate(StringTuner._strings):
+                t = np.array(s._motion_t)
+                if len(t):
+                    n = freq_to_number(np.array(s._motion_f)) - s._note
+                    p, = self._subplot.plot(t - t[0], n, linestyle='-',marker='.')
+            p  = self._subplot.axhline(y=0,color='b',linestyle=':')
+            p  = self._subplot.axhline(y=0.5,color='r',linestyle=':')
+            p  = self._subplot.axhline(y=-0.5,color='r',linestyle=':')
+            self._subplot.set_ylim(-1,1)
 
 class PortSelector:
     def __init__(self, parent):
@@ -531,7 +624,7 @@ class AxisControl(Frame):
         self.updateLabel()
 
     def set_origin(self):
-        self._tuner.reset()        
+        self._tuner.reset()
         self.updateLabel()
         
     def motor_off(self):
@@ -563,20 +656,27 @@ class PianoRoll(Frame):
     song = [-1,1,2,4,6,2,6,5,1,5,4,0,4,-1,1,2,4,6,2,6,11 ,9,6,2,6, 9,
             -1,1,2,4,6,2,6,5,1,5,4,0,4,-1,1,2,4,6,2,6,11 ,9,6,2,6, 9]
     
+    # Row Row Row Your Boat
+    # https://www.youtube.com/watch?v=ROqgdTRa0bE
+    song = [0,0,0,2,4,4,2,4,5,7,12,12,12,7,7,7,4,4,4,0,0,0,7,5,4,2,0]
+    
+    song = [0,2,4,5,7,9]
+
+    line_height = 20
+    note_width  = 50
     left_margin = 70
-    note_width  = 20
     
     _playing    = None
+    _notes      = []
+    _label      = []
     
-    def __init__(self, parent):        
+    def __init__(self, parent):
         labels = StringTuner._note_str
-        line_height = 20
-        note_width  = 20
         canvas_width  = len(self.song) * self.note_width + self.left_margin
-        canvas_height = line_height*len(labels)
-        font=("Helvetica", -line_height+4)
+        canvas_height = self.line_height*(len(labels)+1)
+        font=("Helvetica", -self.line_height+4)
         
-        Frame.__init__(self, parent, width=100, bd=2, relief=SUNKEN)
+        Frame.__init__(self, parent, bd=2, relief=SUNKEN)
         self.grid_rowconfigure(0, weight=1)
         self.grid_columnconfigure(0, weight=1)
 
@@ -591,6 +691,7 @@ class PianoRoll(Frame):
                         xscrollcommand=xscrollbar.set,
                         yscrollcommand=yscrollbar.set,
                         width=300, height=canvas_height)
+        self.canvas = c
 
         c.grid(row=0, column=0, sticky=N+S+E+W)
 
@@ -598,24 +699,42 @@ class PianoRoll(Frame):
         yscrollbar.config(command=c.yview)
 
         for i in range(0,len(labels)):
-          c.create_line(0,   line_height*(i+1  ), canvas_width, line_height*(i+1  ))
-          c.create_text(self.left_margin  - 15, line_height*(i+0.5), text=labels[i], anchor=E, font=font)
+          c.create_line(0, self.line_height*(i+1  ), 90000, self.line_height*(i+1  ))
+          c.create_text(self.left_margin  - 15, self.line_height*(i+1.5), text=labels[i], anchor=E, font=font)
 
-        min_note = min(self.song)          
-        for i,n in enumerate(self.song):
-            x0 = self.left_margin + i     * self.note_width
-            x1 = self.left_margin + (i+1) * self.note_width
-            y0 = line_height * (n-min_note)
-            y1 = line_height * (n-min_note+1)
-            c.create_rectangle(x0, y0, x1, y1, fill="gray")
+        #min_note = min(self.song)          
+        #for i,n in enumerate(self.song):
+        #    self.add_note_to_canvas(i, n-min_note+NOTE_MIN):
 
-        self.t = 1
+        self.t = 0
         self.t_line = c.create_line(self.left_margin, 0, self.left_margin, canvas_height, fill="red", dash=(4, 4))
+        self.update_time()
         
-        self.canvas = c
+    def add_notes(self, notes, label=""):
+        pos = len(self._notes)
+        fill = "red"
+        for n in notes:
+            self.add_note_to_canvas(pos, n, fill)
+            fill = "gray"
+        if label:
+            self.add_label_to_canvas(pos, label)
+        self._notes.append(notes)
+        self._label.append(label)
+
+    def add_label_to_canvas(self, pos, label):
+        x = self.left_margin + (pos+0.5) * self.note_width
+        y = self.line_height * 0.5
+        self.canvas.create_text(x, y, text=label)
+    
+    def add_note_to_canvas(self, pos, note, fill="gray"):
+        x0 = self.left_margin + pos     * self.note_width
+        x1 = self.left_margin + (pos+1) * self.note_width
+        y0 = self.line_height * (note-NOTE_MIN+1)
+        y1 = self.line_height * (note-NOTE_MIN+2)
+        self.canvas.create_rectangle(x0, y0, x1, y1, fill=fill)
         
     def update_time(self):
-        x = self.left_margin + self.t
+        x = self.left_margin + (self.t + 0.5) * self.note_width
         self.canvas.coords(self.t_line, x, 0, x, self.canvas.cget('height'))
         
     def update(self, sp):
@@ -624,65 +743,123 @@ class PianoRoll(Frame):
 
     def play(self):
         if not self._playing:
-            self._playing = []
+            self._playing = True
             self.t = 0
-            m = min(self.song)
-            for n in self.song:
-                self._playing.append(int(n-m+NOTE_MIN))
-                print("Begin playing song")
-        else:
-            self._playing = False
+            
+    def stop(self):
+        self._playing = False
 
     def next_note(self):
         if self._playing:
-            StringTuner._strings[0].goto_note(self._playing.pop(0))
-            self.t += self.note_width
+            StringTuner.play_chord(self._notes[self.t])
+            self.t = (self.t+1) % len(self._notes)
             self.update_time()
 
+class ChordPicker(Frame):
+    def __init__(self, parent):
+        self.parent = parent
+        
+        Frame.__init__(self, parent, bd=2, relief=SUNKEN)
+        Label(self, text="Chords").grid(row=0,columnspan=12)
 
-class Application(Frame):
-    def connect(self):
-        if not self._serial:
-            d = PortSelector(root)
-            root.wait_window(d.top)
-            if d.portname:
-                self._serial = serial.Serial(d.portname, baudrate=250000)
-                self.connect_btn["text"]    = "Disconnect"
-                self.connect_btn["command"] = self.disconnect
-                self.after(5000, self.initMarlin)
+        def makeFunc(note, root, chord):
+            return lambda: self.selectChord(note,root,chord)
 
-    def disconnect(self, exiting = False):
+        for i, root in enumerate(["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]):
+            b = Button(self, text=root+"maj", command=makeFunc(i+60, root, "maj")).grid(row=1,column=i)
+            b = Button(self, text=root+"min", command=makeFunc(i+60, root, "min")).grid(row=2,column=i)
+            
+    def selectChord(self, note, root, chord):
+        if chord == "maj":
+            notes = [note+0, note+4, note+7]
+        elif chord == "min":
+            notes = [note+0, note+3, note+7]
+        
+        # If the notes do fall in the range of the instrument,
+        # find a chord inversion that does.
+        notes = [self.findNoteInRange(note) for note in notes]
+        app._pianoroll.add_notes(notes, root+chord)
+        StringTuner.play_chord(notes)
+        
+    def findNoteInRange(self, note):
+        """Shift a note up or down an octave until it fits the note range of the instrument"""
+        while note < NOTE_MIN:
+            note += 12
+        while note > NOTE_MAX:
+            note -= 12
+        return note
+    
+class Marlin:
+    def __init__(self):
+        self._serial = None
+        self._in_motion = False
+        self._when_done = None
+
+    def connect(self, port):
+        self._serial = serial.Serial(port, baudrate=250000)
+                
+    def disconnect(self):
         if self._serial:
             self._serial.close()
             self._serial = None
-        if not exiting:
-            self.connect_btn["text"]    = "Connect"
-            self.connect_btn["command"] = self.connect
-            
-    def initMarlin(self):
-        self.send("M211 S0") # Turn off endstops
-        self.send("M203 X90000 Y90000 Z90000") # Max feedrate
 
     def send(self, cmd):
         if self._serial:
             self._serial.write((cmd+'\n').encode())
             print(cmd)
-            
-    def send_position_and_wait(self, axis, position):
+
+    def send_position(self, axis, position, when_done = None):
         if self._serial:
-            self.send('G0 %s%f F90000\nM400\nM114\n' % (axis, position))
-            while(1):
-                if self._serial.inWaiting():
-                    line = self._serial.readline()
-                    if line.startswith(b"X:"):
-                        break
+            self.send('G0 %s%f F90000' % (axis, position))
+            if when_done:
+                self._in_motion = True
+                self.send('M400\nM114')
+                self._when_done = when_done
                 
-    def receive(self):
-        if self._serial:
-            if self._serial.inWaiting():
-                line = self._serial.readline()
-                print("Serial: ",line)
+    def update(self):
+        if not self._serial:
+            return
+        
+        if self._serial.inWaiting():
+            line = self._serial.readline()
+            print(line.decode().strip())
             
+            if self._in_motion and line.startswith(b"X:"):
+                self._in_motion = False
+                if self._when_done:
+                    self._when_done()
+                    
+            if line.startswith(b"start"):
+                self.initMarlin()
+
+    def initMarlin(self):
+        self.send("M211 S0") # Turn off endstops
+        self.send("M203 X90000 Y90000 Z90000") # Max feedrate
+        self.send("M201 X18000 Y18000 Z18000") # Max acceleration
+        self.send("M204 T18000")               # Max starting accelration
+        self.send("M907 S870")                 # Set motor current
+ 
+class Application(Frame):
+    def connect(self):
+        d = PortSelector(root)
+        root.wait_window(d.top)
+        if d.portname:
+            self._marlin.connect(d.portname)
+            self.connect_btn["text"]    = "Disconnect"
+            self.connect_btn["command"] = self.disconnect
+
+    def disconnect(self, exiting = False):
+        self._marlin.disconnect()
+        if not exiting:
+            self.connect_btn["text"]    = "Connect"
+            self.connect_btn["command"] = self.connect
+            
+    def send_position(self, axis, position, when_done = None):
+        self._marlin.send_position(axis, position, when_done)
+    
+    def send(self, cmd):
+        self._marlin.send(cmd)
+        
     def showSpectrum(self):
         t = tk.Toplevel(self)
         self.fig = FFTGraph()
@@ -695,8 +872,21 @@ class Application(Frame):
         self.map_page = GraphPage(t)
         self.map_page.add_mpl_figure(self.fig)
         
-    def playSong(self):
+    def showMotion(self):
+        t = tk.Toplevel(self)
+        self.fig = MotionGraph()
+        self.motion_page = GraphPage(t)
+        self.motion_page.add_mpl_figure(self.fig)
+    
+    def startPlaying(self):
         self._pianoroll.play()
+        self.play_btn["text"]    = "Stop"
+        self.play_btn["command"] = self.stopPlaying
+        
+    def stopPlaying(self):
+        self._pianoroll.stop()
+        self.play_btn["text"]    = "Play"
+        self.play_btn["command"] = self.startPlaying
 
     def createWidgets(self):
         # Buttons
@@ -706,16 +896,25 @@ class Application(Frame):
         self.connect_btn = Button(f, text = "Connect",  command = self.connect           )
         self.spec_btn    = Button(f, text = "Spectrum", command = self.showSpectrum      )
         self.pitch_btn   = Button(f, text = "Pitches",  command = self.showPitches       )
-        self.play_btn    = Button(f, text = "Song",     command = self.playSong          )
+        self.motion_btn  = Button(f, text = "Motion",   command = self.showMotion        )
         self.quit_btn.pack(   {"side": "left"})
         self.connect_btn.pack({"side": "left"})
         self.spec_btn.pack({"side": "left"})
         self.pitch_btn.pack({"side": "left"})
-        self.play_btn.pack({"side": "left"})
-
+        self.motion_btn.pack({"side": "left"})
+        
+        f = Frame(self)
+        # Chord Picker
+        self._chord_picker = ChordPicker(f)
+        self._chord_picker.pack({"side": "left"})
+        
+        self.play_btn    = Button(f, text = "Play", command = self.startPlaying, width=10, font=("Helvetica",16,"bold"))
+        self.play_btn.pack({"side": "right", "fill":"y", "padx" : 10,  "pady" : 10})
+        f.pack({"side": "top", "padx" : 10, "fill":"x", "expand":1})
+        
         # Scrolling Canvas
         self._pianoroll = PianoRoll(self)
-        self._pianoroll.pack({"side": "top", "pady" : 20, "padx" : 10})
+        self._pianoroll.pack({"side": "top", "padx" : 10, "fill":"x"})
         
         # Axis Control Buttons
         f = Frame(self)
@@ -724,21 +923,23 @@ class Application(Frame):
         f.pack({"side": "top", "pady" : 20})
         
     def __init__(self, master=None):
-        self._serial = None
+        self._marlin = Marlin()
         self._sp = SoundProcessor()
+        self._in_motion = False
         
         self._strings = []
         for a in string_axis:
             self._strings.append(StringTuner(self, a)) 
         
         Frame.__init__(self, master)
-        self.pack()
+        self.pack({"fill":"both"})
         self.createWidgets()
         self.idle()
 
     def idle(self):
       self.after(100, self.idle)
       
+      self._marlin.update()
       self._sp.process_audio_data()
       
       StringTuner.update(self._sp)
@@ -748,6 +949,9 @@ class Application(Frame):
           
       if hasattr(self,"map_page"):
           self.map_page.refresh(self._sp)
+          
+      if hasattr(self,"motion_page"):
+          self.motion_page.refresh(self._sp)
           
       self._pianoroll.update(self._sp)
       
